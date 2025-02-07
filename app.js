@@ -1,23 +1,18 @@
-import express, { request, response } from 'express'
-import session from 'express-session'
-import bodyParser from 'body-parser'
-import { v4 as uuidv4 } from 'uuid'; //versión 4 de uuid
-import os, { networkInterfaces } from 'os';
-import macaddress from 'macaddress';
+import express from 'express';
+import mongoose from 'mongoose';
+import session from 'express-session';
+import os from 'os';
 import moment from 'moment-timezone';
-
+import { v4 as uuidv4 } from 'uuid';
+import Session from './src/models/Session.js';
+import connectDB from './databases.js';
 
 const app = express();
-const PORT = 3000;
-
-app.listen(PORT, () => {
-    console.log(`Servidor iniciado en http://localhost${PORT}`);
-});
-
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
-const sessions = {};
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Servidor en http://localhost:${PORT}`));
 
 // Configuración de la sesión
 app.use(session({
@@ -37,158 +32,187 @@ app.get('/', (req, res) => {
     });
 });
 
-const getLocalIp = () => {
+connectDB();
+
+// Obtener la IP local del servidor
+const getLocalIP = () => {
     const networkInterfaces = os.networkInterfaces();
-    for (const interfaceName in networkInterfaces) {
-        const interfaces = networkInterfaces[interfaceName];
+    for (const interfaces of Object.values(networkInterfaces)) {
         for (const iface of interfaces) {
-            if (iface.family === "IPv4" && !iface.internal) {
-                return iface.address;
+            if (iface.family === 'IPv4' && !iface.internal) {
+                return { ip: iface.address, mac: iface.mac };
             }
         }
     }
-    return null;
+    return { ip: null, mac: null };
 };
 
-const getServerMac = () => {
-    return new Promise((resolve, reject) => {
-        macaddress.one((err, mac) => {
-            if (err) {
-                reject(err);
-            }
-            resolve(mac);
-        });
-    });
-};
 
+
+// Iniciar sesión
 app.post('/login', async (req, res) => {
     const { email, nickname, macAddress } = req.body;
     if (!email || !nickname || !macAddress) {
-        return res.status(400).json({
-            message: 'Se esperan campos requeridos'
-        });
+        return res.status(400).json({ message: 'Se esperan campos requeridos' });
     }
-
     const sessionID = uuidv4();
-    const createdAt_CDMX = moment().tz('America/Mexico_City').format('YYYY/MM/DD HH:mm:ss');
-
-    req.session.email = email;
-    req.session.sessionID = sessionID;
-    req.session.nickname = nickname;
-    req.session.macAddress = macAddress;
-    req.session.createdAt = createdAt_CDMX;
-    req.session.lastAccessed = createdAt_CDMX;
-    req.session.serverIp = getLocalIp();
-    req.session.serverMac = await getServerMac();
-
-    sessions[sessionID] = req.session;
-
-    res.status(200).json({
-        message: 'Se ha logueado de manera exitosa',
-        sessionID
-    });
-});
-
-app.post('/logout', (req, res) => {
-    if (!req.session.sessionID || !sessions[req.session.sessionID]) {
-        return res.status(404).json({
-            message: 'No existe una sesión activa'
-        });
-    }
-
-    delete sessions[req.session.sessionID];
-    req.session.destroy((err) => {
-        if (err) {
-            return res.status(500).json({
-                message: 'Error no se pudo cerrar sesión'
-            });
-        }
-    });
-
-    res.status(200).json({
-        message: 'Logout exitoso'
-    });
-});
-
-app.post('/update', (req, res) => {
-    const { email, nickname } = req.body;
-
-    if (!req.session.sessionID || !sessions[req.session.sessionID]) {
-        return res.status(404).json({
-            message: 'No hay una sesión activa'
-        });
-    }
-    if (nickname) req.session.nickname = nickname;
-    if (email) req.session.email = email;
-   
-    req.session.lastAccessed = moment().tz('America/Mexico_City').format('YYYY/MM/DD HH:mm:ss');
-
-    sessions[req.session.sessionID] = req.session;
-
-    // Clonar el objeto de sesión sin la cookie
-    const sessionData = { ...req.session };
-    delete sessionData.cookie; // Eliminar la cookie de la respuesta
-
-    res.status(200).json({
-        message: 'Datos actualizados',
-        session: sessionData
-    });
-});
-app.get('/status', (req, res) => {
-    if (!req.session.sessionID || !sessions[req.session.sessionID]) {
-        return res.status(404).json({
-            message: 'No existe una sesión activa'
-        });
-    }
-
-    const session = sessions[req.session.sessionID];
-    const now = moment();
-    const idleTime = now.diff(moment(session.lastAccessed, 'YYYY/MM/DD HH:mm:ss'), 'seconds');
-    const duration = now.diff(moment(session.createdAt, 'YYYY/MM/DD HH:mm:ss'), 'seconds');
+    const now = new Date();
+    const networkInfo = getLocalIP();
     
-    // Crear una copia del objeto de sesión sin la propiedad 'cookie'
-    const sessionData = { ...session };
-    delete sessionData.cookie; // Eliminar la cookie
+    const newSession = new Session({
+        sessionId: sessionID,
+        email,
+        nickname,
+        status: 'Activa',
+        clientData: { clientIp: networkInfo.ip, clientMac: macAddress },
+        serverData: { serverIp: networkInfo.ip, serverMac: networkInfo.mac },
+        createdAt: now,
+        lastAccessed: now,
+    });
+    await newSession.save();
+
+    req.session.sessionID = sessionID;
+    res.status(200).json({ message: 'Login exitoso', sessionID });
+});
+
+app.post('/logout', async (req, res) => {
+    const { sessionID } = req.body;
+    if (!sessionID) return res.status(400).json({ message: 'Session ID requerido' });
+
+    const session = await Session.findOne({ sessionId: sessionID });
+
+    if (!session) return res.status(404).json({ message: 'Sesión no encontrada' });
+
+    // Si la sesión ya está cerrada, evitar hacer cambios
+    if (session.status !== 'Activa') {
+        return res.status(400).json({ message: 'No hay sesión activa' });
+    }
+
+    //  Marcar la sesión como finalizada
+    session.status = 'Finalizada por el Usuario';
+    await session.save();
+
+    //  Destruir la sesión en Express
+    req.session.destroy((err) => {
+        if (err) return res.status(500).json({ message: 'Error al cerrar sesión' });
+        res.status(200).json({ message: 'Sesión cerrada exitosamente' });
+    });
+});
+
+app.put('/update', async (req, res) => {
+    const { sessionID } = req.body;
+    if (!sessionID) return res.status(400).json({ message: 'Session ID requerido' });
+
+    const session = await Session.findOne({ sessionId: sessionID });
+
+    if (!session) return res.status(404).json({ message: 'Sesión no encontrada' });
+
+    // Si la sesión ya está cerrada, no permitir actualizarla
+    if (session.status !== 'Activa') {
+        return res.status(400).json({ message: 'No hay nada que actualizar porque la sesión ya está cerrada' });
+    }
+
+    // Si la sesión sigue activa, actualizar la última actividad
+    session.lastAccessed = new Date();
+    await session.save();
+    res.status(200).json({ message: 'Sesión actualizada', session });
+});
+
+// Consultar estado de la sesión
+app.post('/status', async (req, res) => {
+    console.log(req.body); // Ver qué llega en la solicitud
+
+    const { sessionID } = req.body;
+    if (!sessionID) {
+        return res.status(400).json({ message: 'Session ID requerido' });
+    }
+
+    // Buscar la sesión en MongoDB
+    const session = await Session.findOne({ sessionId: sessionID });
+
+    if (!session) {
+        return res.status(404).json({ message: 'Sesión no encontrada' });
+    }
+
+    //  Si la sesión ya fue cerrada, no debe devolver datos
+    if (session.status !== 'Activa') {
+        return res.status(403).json({ message: 'No hay sesión activa' });
+    }
+
+    // Verificar si ya pasó más de 2 minutos de inactividad
+    const now = new Date();
+    const twoMinutesAgo = new Date(now - 120000);
+
+    if (session.lastAccessed < twoMinutesAgo) {
+        // Cerrar sesión automáticamente y actualizar el estado en la base de datos
+        session.status = 'Finalizada por inactividad';
+        await session.save();
+        return res.status(403).json({ message: 'No hay sesión activa' });
+    }
+
+    // Calcular el tiempo de inactividad
+    const inactivitySeconds = Math.floor((now - session.lastAccessed) / 1000);
+    const hours = Math.floor(inactivitySeconds / 3600);
+    const minutes = Math.floor((inactivitySeconds % 3600) / 60);
+    const seconds = inactivitySeconds % 60;
 
     res.status(200).json({
         message: 'Sesión activa',
-        session: sessionData, // Usar sessionData sin la cookie
-        idleTime: `${idleTime} segundos`,
-        duration: `${duration} segundos`
-    });
-});
-app.get('/sessionactives', (req, res) => {
-    if (Object.keys(sessions).length === 0) {
-        return res.status(404).json({
-            message: 'No hay sesiones activas'
-        });
-    }
-
-    const formattedSessions = {};
-    for (const sessionID in sessions) {
-        const session = sessions[sessionID];
-        // Eliminar la propiedad 'cookie' antes de enviar la respuesta
-        const { cookie, ...sessionWithoutCookie } = session;
-        formattedSessions[sessionID] = {
-            ...sessionWithoutCookie,
-            createdAt: moment(session.createdAt).tz('America/Mexico_City').format('YYYY/MM/DD HH:mm:ss'),
-            lastAccessed: moment(session.lastAccessed).tz('America/Mexico_City').format('YYYY/MM/DD HH:mm:ss')
-        };
-    }
-
-    res.status(200).json({
-        message: 'Sesiones activas',
-        sessions: formattedSessions
+        session,
+        inactivityTime: `${hours}h ${minutes}m ${seconds}s`,
     });
 });
 
-setInterval(() => {
-    const now = moment();
-    for (const sessionID in sessions) {
-        const session = sessions[sessionID];
-        const idleTime = now.diff(moment(session.lastAccessed, 'YYYY/MM/DD HH:mm:ss'), 'seconds');
-        if (idleTime > 120) { 
-            delete sessions[sessionID];
+
+// Obtener todas las sesiones sin importar su estado
+app.get('/allSessions', async (req, res) => {
+    try {
+        const allSessions = await Session.find({});
+        res.status(200).json({ message: 'Todas las sesiones', allSessions });
+    } catch (error) {
+        res.status(500).json({ message: 'Error al obtener todas las sesiones', error });
+    }
+});
+
+// Obtener todas las sesiones activas
+app.get('/allCurrentSessions', async (req, res) => {
+    try {
+        const activeSessions = await Session.find({ status: 'Activa' });
+        if (activeSessions.length === 0) {
+            return res.status(404).json({ message: 'No hay sesiones activas' });
         }
+        res.status(200).json({ message: 'Sesiones activas', activeSessions });
+    } catch (error) {
+        res.status(500).json({ message: 'Error al obtener sesiones activas', error });
     }
-}, 60000);
+});
+
+// Eliminar todas las sesiones (PELIGROSO)
+app.delete('/deleteAllSessions', async (req, res) => {
+    try {
+        await Session.deleteMany({});
+        res.status(200).json({ message: 'Todas las sesiones eliminadas' });
+    } catch (error) {
+        res.status(500).json({ message: 'Error al eliminar sesiones', error });
+    }
+});
+
+// Cerrar sesiones inactivas automáticamente después de 2 minutos
+setInterval(async () => {
+    const now = new Date();
+    const twoMinutesAgo = new Date(now - 120000);
+
+    // Buscar sesiones inactivas y cambiar su estado
+    const sessionsToClose = await Session.find({
+        lastAccessed: { $lt: twoMinutesAgo },
+        status: 'Activa',
+    });
+
+    if (sessionsToClose.length > 0) {
+        for (const session of sessionsToClose) {
+            session.status = 'Finalizada por falla de Sistema';
+            await session.save();
+        }
+        console.log(`Cerradas ${sessionsToClose.length} sesiones inactivas.`);
+    }
+}, 60000); // Se ejecuta cada 60 segundos
