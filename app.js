@@ -1,40 +1,64 @@
+
 import express from 'express';
 import mongoose from 'mongoose';
 import session from 'express-session';
 import os from 'os';
 import moment from 'moment-timezone';
 import { v4 as uuidv4 } from 'uuid';
-import Session from './src/models/Session.js';
+import Session from './Session.js';
 import connectDB from './databases.js';
+import crypto from 'crypto';
+import fs from 'fs';
 
 const app = express();
 app.use(express.json());
 
+// 📌 Leer claves solo una vez
+const publicKey = fs.readFileSync('public.pem', 'utf8');
+const privateKey = fs.readFileSync('private.pem', 'utf8');
+
+// 🔐 Función para encriptar la MAC con la clave pública
+const encryptMAC = (macAddress) => {
+    try {
+        const encrypted = crypto.publicEncrypt(publicKey, Buffer.from(macAddress, 'utf8'));
+        return encrypted.toString('base64');  // Convertir a base64
+    } catch (error) {
+        console.error('Error al encriptar la MAC:', error);
+        return null;
+    }
+};
+
+// 🔓 Función para desencriptar la MAC con la clave privada
+const decryptMAC = (encryptedMac) => {
+    try {
+        const decrypted = crypto.privateDecrypt(privateKey, Buffer.from(encryptedMac, 'base64'));
+        return decrypted.toString('utf8');
+    } catch (error) {
+        console.error('Error al desencriptar la MAC:', error);
+        return null;
+    }
+};
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Servidor en http://localhost:${PORT}`));
 
-// Configuración de la sesión
 app.use(session({
-    secret: 'p2-KLNH#jinx-sesionespersistentes',  // Secreto para firmar la cookie de sesión
-    resave: false,  // No resguardar la sesión si no ha sido modificada
-    saveUninitialized: true,  // Guardar la sesión aunque no haya sido inicializada
-    cookie: { maxAge: 5 * 60 * 1000}  // Usar secure: true si usas HTTPS
+    secret: 'p2-KLNH#jinx-sesionespersistentes',
+    resave: false,
+    saveUninitialized: true,
+    cookie: { maxAge: 5 * 60 * 1000 }
 }));
-
-
-// Ruta de bienvenida
 
 app.get('/', (req, res) => {
     return res.status(200).json({
         message: "Bienvenid@ al API de control de Sesiones",
-                                 author: "Karen Lizbeth Negrete Hernández"
+        author: "Karen Lizbeth Negrete Hernández"
     });
 });
 
 connectDB();
 
-// Obtener la IP local del servidor
+// 📌 Obtener IP y MAC local
 const getLocalIP = () => {
     const networkInterfaces = os.networkInterfaces();
     for (const interfaces of Object.values(networkInterfaces)) {
@@ -47,33 +71,49 @@ const getLocalIP = () => {
     return { ip: null, mac: null };
 };
 
-
-
-// Iniciar sesión
+// 🔑 **Ruta de login**
 app.post('/login', async (req, res) => {
     const { email, nickname, macAddress } = req.body;
     if (!email || !nickname || !macAddress) {
         return res.status(400).json({ message: 'Se esperan campos requeridos' });
     }
+
+    const encryptedMac = encryptMAC(macAddress);  // 🔐 Encriptar la MAC
+    if (!encryptedMac) return res.status(500).json({ message: 'Error al encriptar la MAC' });
+
     const sessionID = uuidv4();
-    const now = new Date();
+    const now = moment().tz('America/Mexico_City').toDate();
     const networkInfo = getLocalIP();
-    
+
     const newSession = new Session({
         sessionId: sessionID,
         email,
         nickname,
         status: 'Activa',
-        clientData: { clientIp: networkInfo.ip, clientMac: macAddress },
-        serverData: { serverIp: networkInfo.ip, serverMac: networkInfo.mac },
+        clientIp: networkInfo.ip,
+        clientMac: encryptedMac,
+        serverIp: networkInfo.ip,
+        serverMac: networkInfo.mac,
         createdAt: now,
         lastAccessed: now,
     });
-    await newSession.save();
 
+    await newSession.save();
     req.session.sessionID = sessionID;
     res.status(200).json({ message: 'Login exitoso', sessionID });
 });
+
+// 🔍 Ruta para probar la desencriptación de MAC
+app.post('/decrypt-mac', (req, res) => {
+    const { encryptedMac } = req.body;
+    if (!encryptedMac) return res.status(400).json({ message: 'Se requiere una MAC encriptada' });
+
+    const decryptedMac = decryptMAC(encryptedMac);
+    if (!decryptedMac) return res.status(500).json({ message: 'Error al desencriptar la MAC' });
+
+    res.status(200).json({ decryptedMac });
+});
+
 
 app.post('/logout', async (req, res) => {
     const { sessionID } = req.body;
@@ -216,3 +256,5 @@ setInterval(async () => {
         console.log(`Cerradas ${sessionsToClose.length} sesiones inactivas.`);
     }
 }, 60000); // Se ejecuta cada 60 segundos
+
+
